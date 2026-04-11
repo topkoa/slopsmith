@@ -605,10 +605,6 @@ async function playSong(filename, arrangement) {
     highway.connect(wsUrl);
     loadSavedLoops();
     document.getElementById('quality-select').value = highway.getRenderScale();
-    const invertBtn = document.getElementById('btn-invert');
-    if (highway.getInverted()) {
-        invertBtn.className = 'px-3 py-1.5 bg-purple-900/40 hover:bg-purple-900/60 rounded-lg text-xs text-purple-300 transition';
-    }
 }
 
 function changeArrangement(index) {
@@ -662,18 +658,6 @@ function setSpeed(v) {
     document.getElementById('speed-label').textContent = parseFloat(v).toFixed(2) + 'x';
 }
 function formatTime(s) { return `${Math.floor(s/60)}:${String(Math.floor(s%60)).padStart(2,'0')}`; }
-
-function toggleInvert() {
-    const on = !highway.getInverted();
-    highway.setInverted(on);
-    const btn = document.getElementById('btn-invert');
-    btn.className = on
-        ? 'px-3 py-1.5 bg-purple-900/40 hover:bg-purple-900/60 rounded-lg text-xs text-purple-300 transition'
-        : 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-300 transition';
-    // Sync plugin settings toggle if present
-    const pluginToggle = document.getElementById('invert-highway-toggle');
-    if (pluginToggle) pluginToggle.checked = on;
-}
 
 // ── A-B Loop ────────────────────────────────────────────────────────────
 let loopA = null;
