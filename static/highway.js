@@ -2,7 +2,7 @@
  * Canvas-based Rocksmith highway renderer.
  * Receives note data via WebSocket, renders on requestAnimationFrame.
  */
-const highway = (() => {
+function createHighway() {
     let canvas, ctx, ws;
     let currentTime = 0;
     let animFrame = null;
@@ -1034,4 +1034,5 @@ const highway = (() => {
             document.getElementById('btn-play').textContent = '▶ Play';
         },
     };
-})();
+}
+const highway = createHighway();
