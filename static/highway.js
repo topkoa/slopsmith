@@ -979,6 +979,27 @@ function createHighway() {
                                 `<option value="${a.index}" ${a.index === msg.arrangement_index ? 'selected' : ''}>${a.name} (${a.notes})</option>`
                             ).join('');
                         }
+                        // Plugin context API — broadcast current song state
+                        {
+                            const wsPath = ws.url.split('/ws/highway/')[1] || '';
+                            const filename = decodeURIComponent(wsPath.split('?')[0]);
+                            if (!window.slopsmithPlayer) window.slopsmithPlayer = { currentSong: null, isPlaying: false };
+                            window.slopsmithPlayer.currentSong = {
+                                filename,
+                                title: msg.title,
+                                artist: msg.artist,
+                                duration: msg.duration,
+                                arrangement: msg.arrangement,
+                                arrangementIndex: msg.arrangement_index,
+                                arrangements: msg.arrangements || [],
+                                tuning: msg.tuning,
+                                capo: msg.capo,
+                                format: msg.format,
+                            };
+                            window.dispatchEvent(new CustomEvent('slopsmith:songloaded', {
+                                detail: window.slopsmithPlayer.currentSong
+                            }));
+                        }
                         break;
                     case 'beats': beats = msg.data; break;
                     case 'sections': sections = msg.data; break;

@@ -647,6 +647,7 @@ function retuneSong(filename, title, tuning, target) {
 const audio = document.getElementById('audio');
 let isPlaying = false;
 let currentFilename = '';
+window.slopsmithPlayer = { currentSong: null, isPlaying: false };
 
 // Debug audio issues
 audio.addEventListener('pause', () => { if (isPlaying) console.log('Audio paused unexpectedly at', audio.currentTime.toFixed(1)); });
@@ -657,7 +658,7 @@ audio.addEventListener('error', (e) => {
 });
 audio.addEventListener('stalled', () => console.log('Audio stalled at', audio.currentTime.toFixed(1)));
 audio.addEventListener('waiting', () => console.log('Audio waiting/buffering at', audio.currentTime.toFixed(1)));
-audio.addEventListener('ended', () => { console.log('Audio ended'); isPlaying = false; document.getElementById('btn-play').textContent = '▶ Play'; });
+audio.addEventListener('ended', () => { console.log('Audio ended'); isPlaying = false; document.getElementById('btn-play').textContent = '▶ Play'; window.slopsmithPlayer.isPlaying = false; window.dispatchEvent(new CustomEvent('slopsmith:playbackchanged', { detail: { isPlaying: false } })); });
 
 // Abort controller for cancelling pending requests when entering player
 let artAbortController = null;
@@ -734,6 +735,8 @@ function togglePlay() {
         audio.play(); isPlaying = true;
         document.getElementById('btn-play').textContent = '⏸ Pause';
     }
+    window.slopsmithPlayer.isPlaying = isPlaying;
+    window.dispatchEvent(new CustomEvent('slopsmith:playbackchanged', { detail: { isPlaying } }));
 }
 
 function seekBy(s) { audio.currentTime = Math.max(0, audio.currentTime + s); }
