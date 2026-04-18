@@ -7,6 +7,7 @@ function showScreen(id) {
     if (id === 'settings') loadSettings();
     if (id !== 'player') { highway.stop(); }
     window.scrollTo(0, 0);
+    if (window.slopsmith) window.slopsmith.emit('screen:changed', { id });
 }
 
 // ── Library ──────────────────────────────────────────────────────────────
@@ -647,7 +648,26 @@ function retuneSong(filename, title, tuning, target) {
 const audio = document.getElementById('audio');
 let isPlaying = false;
 let currentFilename = '';
-window.slopsmithPlayer = { currentSong: null, isPlaying: false };
+// Plugin context API — lightweight event bus for plugin integration
+window.slopsmith = Object.assign(new EventTarget(), {
+    currentSong: null,
+    isPlaying: false,
+    _navParams: {},
+    navigate(screenId, params) {
+        this._navParams = params || {};
+        showScreen(screenId);
+    },
+    getNavParams() {
+        const p = this._navParams;
+        this._navParams = {};
+        return p;
+    },
+    emit(event, detail) {
+        this.dispatchEvent(new CustomEvent(event, { detail }));
+    },
+    on(event, fn) { this.addEventListener(event, fn); },
+    off(event, fn) { this.removeEventListener(event, fn); }
+});
 
 // Debug audio issues
 audio.addEventListener('pause', () => { if (isPlaying) console.log('Audio paused unexpectedly at', audio.currentTime.toFixed(1)); });
@@ -658,7 +678,21 @@ audio.addEventListener('error', (e) => {
 });
 audio.addEventListener('stalled', () => console.log('Audio stalled at', audio.currentTime.toFixed(1)));
 audio.addEventListener('waiting', () => console.log('Audio waiting/buffering at', audio.currentTime.toFixed(1)));
-audio.addEventListener('ended', () => { console.log('Audio ended'); isPlaying = false; document.getElementById('btn-play').textContent = '▶ Play'; window.slopsmithPlayer.isPlaying = false; window.dispatchEvent(new CustomEvent('slopsmith:playbackchanged', { detail: { isPlaying: false } })); });
+audio.addEventListener('ended', () => {
+    console.log('Audio ended'); isPlaying = false;
+    document.getElementById('btn-play').textContent = '▶ Play';
+    window.slopsmith.isPlaying = false;
+    window.slopsmith.emit('song:ended', { time: audio.currentTime });
+});
+audio.addEventListener('play', () => {
+    window.slopsmith.isPlaying = true;
+    window.slopsmith.emit('song:play', { time: audio.currentTime });
+});
+audio.addEventListener('pause', () => {
+    if (!isPlaying) return;
+    window.slopsmith.isPlaying = false;
+    window.slopsmith.emit('song:pause', { time: audio.currentTime });
+});
 
 // Abort controller for cancelling pending requests when entering player
 let artAbortController = null;
@@ -724,6 +758,7 @@ function changeArrangement(index) {
         };
 
         highway.reconnect(currentFilename, index);
+        window.slopsmith.emit('arrangement:changed', { index, filename: currentFilename });
     }
 }
 
@@ -735,8 +770,6 @@ function togglePlay() {
         audio.play(); isPlaying = true;
         document.getElementById('btn-play').textContent = '⏸ Pause';
     }
-    window.slopsmithPlayer.isPlaying = isPlaying;
-    window.dispatchEvent(new CustomEvent('slopsmith:playbackchanged', { detail: { isPlaying } }));
 }
 
 function seekBy(s) { audio.currentTime = Math.max(0, audio.currentTime + s); }

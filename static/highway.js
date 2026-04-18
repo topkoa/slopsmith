@@ -980,11 +980,10 @@ function createHighway() {
                             ).join('');
                         }
                         // Plugin context API — broadcast current song state
-                        {
+                        if (window.slopsmith) {
                             const wsPath = ws.url.split('/ws/highway/')[1] || '';
                             const filename = decodeURIComponent(wsPath.split('?')[0]);
-                            if (!window.slopsmithPlayer) window.slopsmithPlayer = { currentSong: null, isPlaying: false };
-                            window.slopsmithPlayer.currentSong = {
+                            window.slopsmith.currentSong = {
                                 filename,
                                 title: msg.title,
                                 artist: msg.artist,
@@ -996,9 +995,7 @@ function createHighway() {
                                 capo: msg.capo,
                                 format: msg.format,
                             };
-                            window.dispatchEvent(new CustomEvent('slopsmith:songloaded', {
-                                detail: window.slopsmithPlayer.currentSong
-                            }));
+                            window.slopsmith.emit('song:loaded', window.slopsmith.currentSong);
                         }
                         break;
                     case 'beats': beats = msg.data; break;
