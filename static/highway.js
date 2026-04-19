@@ -1068,6 +1068,7 @@ function createHighway() {
         getSections() { return sections; },
         getSongInfo() { return songInfo; },
         addDrawHook(fn) { _drawHooks.push(fn); },
+        removeDrawHook(fn) { _drawHooks = _drawHooks.filter(h => h !== fn); },
         project(tOffset) { return project(tOffset); },
         fretX(fret, scale, w) { return fretX(fret, scale, w); },
 
