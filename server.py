@@ -15,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from psarc import unpack_psarc, read_psarc_entries
 from song import load_song, parse_arrangement
 from audio import find_wem_files, convert_wem
+from tunings import tuning_name
 import sloppak as sloppak_mod
 
 import concurrent.futures
@@ -327,44 +328,6 @@ def _get_dlc_dir() -> Path | None:
 
 # ── Background metadata scan ──────────────────────────────────────────────────
 
-def _tuning_name(offsets: list[int]) -> str:
-    # Standard tunings (all strings same offset)
-    standard = {
-        0: "E Standard", -1: "Eb Standard", -2: "D Standard",
-        -3: "C# Standard", -4: "C Standard", -5: "B Standard",
-        -6: "Bb Standard", -7: "A Standard",
-        1: "F Standard", 2: "F# Standard",
-    }
-    if len(offsets) >= 6 and all(o == offsets[0] for o in offsets):
-        name = standard.get(offsets[0])
-        if name:
-            return name
-
-    # Drop tunings (low string 2 semitones below the rest)
-    # Named after the low string's note: e.g. offsets[-2,0,0,0,0,0] = Drop D (low E dropped to D)
-    if len(offsets) >= 6 and offsets[0] == offsets[1] - 2 and all(o == offsets[1] for o in offsets[1:]):
-        note_names = ["E", "F", "F#", "G", "Ab", "A", "Bb", "B", "C", "C#", "D", "Eb"]
-        low_note = note_names[offsets[0] % 12]
-        return f"Drop {low_note}"
-
-    # Common named tunings
-    named = {
-        (-2, 0, 0, 0, 0, 0): "Drop D",
-        (-4, -2, -2, -2, -2, -2): "Drop C",
-        (-2, -2, 0, 0, 0, 0): "Double Drop D",
-        (0, 0, 0, -1, 0, 0): "Open G",
-        (-2, -2, 0, 0, -2, -2): "Open D",
-        (-2, 0, 0, 0, -2, 0): "DADGAD",
-        (0, 2, 2, 1, 0, 0): "Open E",
-        (-2, 0, 0, 2, 3, 2): "Open D (alt)",
-    }
-    key = tuple(offsets[:6])
-    if key in named:
-        return named[key]
-
-    return " ".join(str(o) for o in offsets)
-
-
 def _extract_meta_fast(psarc_path: Path) -> dict:
     """Extract metadata from a PSARC using in-memory reading (no disk I/O)."""
     files = read_psarc_entries(str(psarc_path), ["*.json", "*.xml", "*vocals*.sng"])
@@ -404,7 +367,7 @@ def _extract_meta_fast(psarc_path: Path) -> dict:
                     tun = attrs.get("Tuning")
                     if tun and isinstance(tun, dict):
                         offsets = [tun.get(f"string{i}", 0) for i in range(6)]
-                        tun_name = _tuning_name(offsets)
+                        tun_name = tuning_name(offsets)
                         is_guitar = arr_name in ("Lead", "Rhythm", "Combo")
                         if tuning == "E Standard" or (is_guitar and not _tuning_from_guitar):
                             tuning = tun_name
@@ -447,7 +410,7 @@ def _extract_meta_sloppak(path: Path) -> dict:
     """Extract metadata for a sloppak (file or directory)."""
     meta = sloppak_mod.extract_meta(path)
     offsets = meta.pop("tuning_offsets", None) or [0] * 6
-    meta["tuning"] = _tuning_name(offsets)
+    meta["tuning"] = tuning_name(offsets)
     meta["format"] = "sloppak"
     return meta
 
@@ -469,7 +432,7 @@ def _extract_meta_for_file(psarc_path: Path) -> dict:
         song = load_song(tmp)
         tuning = "E Standard"
         if song.arrangements and song.arrangements[0].tuning:
-            tuning = _tuning_name(song.arrangements[0].tuning)
+            tuning = tuning_name(song.arrangements[0].tuning)
         arrangements = [
             {"index": i, "name": a.name,
              "notes": len(a.notes) + sum(len(c.notes) for c in a.chords)}
@@ -493,25 +456,46 @@ def _extract_meta_for_file(psarc_path: Path) -> dict:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-_scan_status = {"running": False, "total": 0, "done": 0, "current": ""}
+_SCAN_STATUS_INIT = {"running": False, "stage": "idle", "total": 0, "done": 0, "current": "", "error": None}
+_scan_status = dict(_SCAN_STATUS_INIT)
 
 
 def _background_scan():
     """Scan all PSARCs and cache metadata on startup. Uses thread pool for parallelism."""
     global _scan_status
+    _scan_status = {**_SCAN_STATUS_INIT, "running": True, "stage": "listing"}
+
     dlc = _get_dlc_dir()
     if not dlc:
-        _scan_status = {"running": False, "total": 0, "done": 0, "current": ""}
+        _scan_status = {**_SCAN_STATUS_INIT, "stage": "idle", "error": "DLC folder not configured"}
+        print("Scan: no DLC folder configured", flush=True)
         return
 
-    # Skip RS1 compatibility mega-PSARCs (multi-song, not individually playable)
-    psarcs = [f for f in sorted(dlc.rglob("*.psarc"))
-              if f.is_file()
-              and "rs1compatibility" not in f.name.lower()]
-    # Sloppaks: match both file (zip) and directory form by suffix.
-    sloppaks = [f for f in sorted(dlc.rglob("*.sloppak"))
-                if sloppak_mod.is_sloppak(f)]
+    # Listing can fail on macOS without Full Disk Access, or on Docker if the
+    # path isn't shared. Report the failure explicitly rather than silently
+    # appearing to scan nothing.
+    try:
+        # Skip RS1 compatibility mega-PSARCs (multi-song, not individually playable)
+        psarcs = [f for f in sorted(dlc.rglob("*.psarc"))
+                  if f.is_file()
+                  and "rs1compatibility" not in f.name.lower()]
+        # Sloppaks: match both file (zip) and directory form by suffix.
+        sloppaks = [f for f in sorted(dlc.rglob("*.sloppak"))
+                    if sloppak_mod.is_sloppak(f)]
+    except PermissionError as e:
+        msg = (f"Permission denied reading {dlc}. "
+               "On macOS: grant Full Disk Access to the app in System Settings → Privacy & Security. "
+               "With Docker: share this path in Docker Desktop → Settings → Resources → File Sharing.")
+        print(f"Scan failed: {msg} ({e})", flush=True)
+        _scan_status = {**_SCAN_STATUS_INIT, "stage": "error", "error": msg}
+        return
+    except OSError as e:
+        print(f"Scan failed listing {dlc}: {e}", flush=True)
+        _scan_status = {**_SCAN_STATUS_INIT, "stage": "error", "error": f"Unable to list {dlc}: {e}"}
+        return
+
     all_songs = psarcs + sloppaks
+    print(f"Scan: listed {len(psarcs)} PSARCs and {len(sloppaks)} sloppaks in {dlc}", flush=True)
 
     def _rel(f: Path) -> str:
         # Store the path relative to the DLC root so sub-folders (e.g.
@@ -528,7 +512,7 @@ def _background_scan():
     # Clean up stale DB entries
     stale = meta_db.delete_missing(current_files)
     if stale:
-        print(f"Removed {stale} stale DB entries")
+        print(f"Removed {stale} stale DB entries", flush=True)
 
     # Figure out which need scanning
     to_scan = []
@@ -538,14 +522,18 @@ def _background_scan():
             to_scan.append((f, stat))
 
     if not to_scan:
-        _scan_status = {"running": False, "total": 0, "done": 0, "current": ""}
+        _scan_status = {**_SCAN_STATUS_INIT, "stage": "complete"}
+        print(f"Scan: nothing new to scan ({len(all_songs)} songs, all cached)", flush=True)
         return
 
-    _scan_status = {"running": True, "total": len(to_scan), "done": 0, "current": ""}
-    print(f"Library: {len(psarcs)} PSARCs + {len(sloppaks)} sloppaks, {len(all_songs) - len(to_scan)} cached, {len(to_scan)} to scan")
+    _scan_status = {**_SCAN_STATUS_INIT, "running": True, "stage": "scanning", "total": len(to_scan)}
+    print(f"Library: {len(psarcs)} PSARCs + {len(sloppaks)} sloppaks, {len(all_songs) - len(to_scan)} cached, {len(to_scan)} to scan", flush=True)
 
     def _scan_one(item):
         f, stat = item
+        # Per-file log so users running the server / desktop can see live
+        # activity and distinguish a stuck scan from a slow one.
+        print(f"  scanning {f.name}", flush=True)
         meta = _extract_meta_for_file(f)
         return _rel(f), stat.st_mtime, stat.st_size, meta
 
@@ -557,27 +545,36 @@ def _background_scan():
                 name, mtime, size, meta = future.result()
                 meta_db.put(name, mtime, size, meta)
             except Exception as e:
-                print(f"  Failed: {fname}: {e}")
+                print(f"  Failed: {fname}: {e}", flush=True)
             _scan_status["done"] += 1
             _scan_status["current"] = fname
 
-    print(f"Scan complete: {len(to_scan)} songs cached")
-    _scan_status = {"running": False, "total": 0, "done": 0, "current": ""}
+    print(f"Scan complete: {len(to_scan)} songs cached", flush=True)
+    _scan_status = {**_SCAN_STATUS_INIT, "stage": "complete"}
 
 
-# ── Load plugins at import time (before app starts) ─────────────────────────
+# ── Register plugin API endpoints (lightweight, before app starts) ───────────
 from plugins import load_plugins, register_plugin_api
 register_plugin_api(app)
-load_plugins(app, {
-    "config_dir": CONFIG_DIR,
-    "get_dlc_dir": _get_dlc_dir,
-    "extract_meta": _extract_meta_for_file,
-    "meta_db": meta_db,
-    "get_sloppak_cache_dir": lambda: SLOPPAK_CACHE_DIR,
-})
+
+# Plugin loading deferred to startup event (see below) to avoid blocking
+# server startup when many plugins are installed.
 
 
 @app.on_event("startup")
+def startup_events():
+    # Load plugins in background after server starts
+    load_plugins(app, {
+        "config_dir": CONFIG_DIR,
+        "get_dlc_dir": _get_dlc_dir,
+        "extract_meta": _extract_meta_for_file,
+        "meta_db": meta_db,
+        "get_sloppak_cache_dir": lambda: SLOPPAK_CACHE_DIR,
+    })
+    # Start background metadata scan
+    startup_scan()
+
+
 def startup_scan():
     """Start background metadata scan and periodic rescan on server start."""
     thread = threading.Thread(target=_background_scan, daemon=True)

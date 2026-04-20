@@ -5,8 +5,16 @@ function showScreen(id) {
     if (id === 'home') loadLibrary();
     if (id === 'favorites') loadFavorites();
     if (id === 'settings') loadSettings();
-    if (id !== 'player') { highway.stop(); }
+    if (id !== 'player') {
+        highway.stop();
+        const audio = document.getElementById('audio');
+        audio.pause();
+        audio.src = '';
+        isPlaying = false;
+        document.getElementById('btn-play').textContent = '▶ Play';
+    }
     window.scrollTo(0, 0);
+    if (window.slopsmith) window.slopsmith.emit('screen:changed', { id });
 }
 
 // ── Library ──────────────────────────────────────────────────────────────
@@ -16,6 +24,12 @@ const PAGE_SIZE = 24;
 let _treeLetter = '';
 let _treeStats = null;
 let _debounceTimer = null;
+let _loadingMore = false;
+let _hasMore = true;
+let _gridObserver = null;
+// Bumped on filter/sort/view changes so in-flight page fetches can detect
+// they've been superseded and skip rendering stale results.
+let _libEpoch = 0;
 
 function setLibView(view) {
     libView = view;
@@ -25,8 +39,8 @@ function setLibView(view) {
     document.querySelectorAll('.lib-tree-ctrl').forEach(el => el.classList.toggle('hidden', view !== 'tree'));
     document.getElementById('view-grid-btn').className = `px-3 py-2.5 text-sm transition ${view === 'grid' ? 'text-accent-light' : 'text-gray-600 hover:text-gray-400'}`;
     document.getElementById('view-tree-btn').className = `px-3 py-2.5 text-sm transition ${view === 'tree' ? 'text-accent-light' : 'text-gray-600 hover:text-gray-400'}`;
-    const pag = document.getElementById('lib-pagination');
-    if (pag && view !== 'grid') pag.innerHTML = '';
+    if (view !== 'grid') stopInfiniteScroll();
+    _libEpoch++;
     loadLibrary();
 }
 
@@ -41,6 +55,7 @@ async function loadLibrary(page) {
 function filterLibrary() {
     clearTimeout(_debounceTimer);
     _debounceTimer = setTimeout(() => {
+        _libEpoch++;
         currentPage = 0;
         _treeLetter = '';
         loadLibrary(0);
@@ -48,56 +63,59 @@ function filterLibrary() {
 }
 
 function sortLibrary() {
+    _libEpoch++;
     currentPage = 0;
     loadLibrary(0);
 }
 
-// ── Grid View (server-side) ─────────────────────────────────────────────
+// ── Grid View (server-side pagination, infinite scroll) ────────────────
 
 async function loadGridPage(page = 0) {
+    const myEpoch = _libEpoch;
     const q = document.getElementById('lib-filter').value.trim();
     const sort = document.getElementById('lib-sort').value;
     const format = (document.getElementById('lib-format') || {}).value || '';
-    currentPage = page;
     const params = new URLSearchParams({ q, page, size: PAGE_SIZE, sort });
     if (format) params.set('format', format);
     const resp = await fetch(`/api/library?${params}`);
     const data = await resp.json();
-    const totalPages = Math.ceil((data.total || 0) / PAGE_SIZE);
+    if (myEpoch !== _libEpoch) return; // filter/sort/view changed mid-fetch
 
-    document.getElementById('lib-count').textContent =
-        `${data.total || 0} songs · Page ${currentPage + 1} of ${Math.max(1, totalPages)}`;
+    currentPage = page;
+    const total = data.total || 0;
+    document.getElementById('lib-count').textContent = `${total} songs`;
 
-    renderGridCards(data.songs || []);
-    renderPagination(totalPages);
+    renderGridCards(data.songs || [], 'lib-grid', page === 0 ? 'replace' : 'append');
+
+    _hasMore = (page + 1) * PAGE_SIZE < total;
+    setupInfiniteScroll();
 }
 
-function renderPagination(totalPages) {
-    let pag = document.getElementById('lib-pagination');
-    if (!pag) {
-        pag = document.createElement('div');
-        pag.id = 'lib-pagination';
-        pag.className = 'flex items-center justify-center gap-2 py-6';
-        document.getElementById('lib-grid').after(pag);
+function setupInfiniteScroll() {
+    let sentinel = document.getElementById('lib-grid-sentinel');
+    if (!sentinel) {
+        sentinel = document.createElement('div');
+        sentinel.id = 'lib-grid-sentinel';
+        sentinel.style.height = '1px';
+        document.getElementById('lib-grid').after(sentinel);
     }
-    if (totalPages <= 1) { pag.innerHTML = ''; return; }
-    let html = '';
-    html += `<button onclick="goPage(0)" class="px-3 py-1.5 rounded-lg text-xs ${currentPage === 0 ? 'text-gray-600 cursor-default' : 'bg-dark-600 text-gray-300 hover:bg-dark-500'}" ${currentPage === 0 ? 'disabled' : ''}>« First</button>`;
-    html += `<button onclick="goPage(${currentPage - 1})" class="px-3 py-1.5 rounded-lg text-xs ${currentPage === 0 ? 'text-gray-600 cursor-default' : 'bg-dark-600 text-gray-300 hover:bg-dark-500'}" ${currentPage === 0 ? 'disabled' : ''}>‹ Prev</button>`;
-    const start = Math.max(0, currentPage - 2);
-    const end = Math.min(totalPages, start + 5);
-    for (let i = start; i < end; i++) {
-        const active = i === currentPage;
-        html += `<button onclick="goPage(${i})" class="px-3 py-1.5 rounded-lg text-xs ${active ? 'bg-accent text-white' : 'bg-dark-600 text-gray-300 hover:bg-dark-500'}">${i + 1}</button>`;
-    }
-    html += `<button onclick="goPage(${currentPage + 1})" class="px-3 py-1.5 rounded-lg text-xs ${currentPage >= totalPages - 1 ? 'text-gray-600 cursor-default' : 'bg-dark-600 text-gray-300 hover:bg-dark-500'}" ${currentPage >= totalPages - 1 ? 'disabled' : ''}>Next ›</button>`;
-    html += `<button onclick="goPage(${totalPages - 1})" class="px-3 py-1.5 rounded-lg text-xs ${currentPage >= totalPages - 1 ? 'text-gray-600 cursor-default' : 'bg-dark-600 text-gray-300 hover:bg-dark-500'}" ${currentPage >= totalPages - 1 ? 'disabled' : ''}>Last »</button>`;
-    pag.innerHTML = html;
+    stopInfiniteScroll();
+    if (!_hasMore) return;
+    _gridObserver = new IntersectionObserver(async (entries) => {
+        if (entries[0].isIntersecting && !_loadingMore && _hasMore) {
+            _loadingMore = true;
+            try { await loadGridPage(currentPage + 1); }
+            finally { _loadingMore = false; }
+        }
+    }, { rootMargin: '400px' });
+    _gridObserver.observe(sentinel);
 }
 
-function goPage(p) {
-    loadLibrary(Math.max(0, p));
-    document.getElementById('library-section').scrollIntoView({ behavior: 'smooth' });
+function stopInfiniteScroll() {
+    if (_gridObserver) {
+        _gridObserver.disconnect();
+        _gridObserver = null;
+    }
 }
 
 function formatBadge(fmt, stemCount) {
@@ -120,9 +138,9 @@ function formatBadgeInline(fmt, stemCount) {
     return `<span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-blue-900/60 text-blue-300">PSARC</span>`;
 }
 
-function renderGridCards(songs, containerId = 'lib-grid') {
+function renderGridCards(songs, containerId = 'lib-grid', mode = 'replace') {
     const grid = document.getElementById(containerId);
-    grid.innerHTML = songs.map(s => {
+    const html = songs.map(s => {
         const title = s.title || s.filename.replace(/_p\.psarc$/i, '').replace(/_/g, ' ');
         const artist = s.artist || '';
         const duration = s.duration ? formatTime(s.duration) : '';
@@ -177,6 +195,11 @@ function renderGridCards(songs, containerId = 'lib-grid') {
             </div>
         </div>`;
     }).join('');
+    if (mode === 'append') {
+        grid.insertAdjacentHTML('beforeend', html);
+    } else {
+        grid.innerHTML = html;
+    }
 }
 
 // ── Tree View (server-side) ─────────────────────────────────────────────
@@ -461,6 +484,18 @@ async function loadSettings() {
     document.getElementById('demucs-server-url').value = data.demucs_server_url || '';
     const leftyEl = document.getElementById('setting-lefty');
     if (leftyEl) leftyEl.checked = highway.getLefty();
+    // Native folder picker — only present when running inside slopsmith-desktop.
+    if (window.slopsmithDesktop && typeof window.slopsmithDesktop.pickDirectory === 'function') {
+        document.getElementById('btn-pick-dlc')?.classList.remove('hidden');
+    }
+}
+
+// Open a native OS folder picker via the Electron bridge (desktop only) and
+// stash the chosen path into the DLC input. User still has to hit Save.
+async function pickDlcFolder() {
+    if (!window.slopsmithDesktop?.pickDirectory) return;
+    const path = await window.slopsmithDesktop.pickDirectory();
+    if (path) document.getElementById('dlc-path').value = path;
 }
 
 async function saveSettings() {
@@ -491,12 +526,13 @@ async function rescanLibrary() {
         const sr = await fetch('/api/scan-status');
         const sd = await sr.json();
         if (sd.running) {
-            status.textContent = `${sd.done} / ${sd.total} scanned...`;
+            const cur = sd.current ? ` · ${sd.current}` : '';
+            status.textContent = `${sd.done} / ${sd.total} scanned${cur}...`;
         } else {
             clearInterval(poll);
             btn.disabled = false;
             btn.textContent = 'Rescan Library';
-            status.textContent = 'Done!';
+            status.textContent = sd.error ? `Error: ${sd.error}` : 'Done!';
             _treeStats = null;
             loadLibrary();
         }
@@ -517,16 +553,70 @@ async function fullRescanLibrary() {
         const sr = await fetch('/api/scan-status');
         const sd = await sr.json();
         if (sd.running) {
-            status.textContent = `${sd.done} / ${sd.total} scanned...`;
+            const cur = sd.current ? ` · ${sd.current}` : '';
+            status.textContent = `${sd.done} / ${sd.total} scanned${cur}...`;
         } else {
             clearInterval(poll);
             btn.disabled = false;
             btn.textContent = 'Full Rescan';
-            status.textContent = 'Done!';
+            status.textContent = sd.error ? `Error: ${sd.error}` : 'Done!';
             _treeStats = null;
             loadLibrary();
         }
     }, 1000);
+}
+
+// ── Plugin Updates ───────────────────────────────────────────────────────
+async function checkPluginUpdates() {
+    const btn = document.getElementById('btn-check-updates');
+    const status = document.getElementById('updates-status');
+    const list = document.getElementById('plugin-updates-list');
+    btn.disabled = true;
+    btn.textContent = 'Checking...';
+    status.textContent = '';
+    list.innerHTML = '';
+    try {
+        const resp = await fetch('/api/plugins/updates');
+        const data = await resp.json();
+        const updates = data.updates || {};
+        const keys = Object.keys(updates);
+        if (keys.length === 0) {
+            status.textContent = 'All plugins are up to date.';
+        } else {
+            status.textContent = `${keys.length} update${keys.length > 1 ? 's' : ''} available`;
+            for (const id of keys) {
+                const u = updates[id];
+                const row = document.createElement('div');
+                row.className = 'flex items-center gap-3 bg-dark-700 rounded-lg px-4 py-2';
+                row.innerHTML = `
+                    <span class="text-sm text-gray-300 flex-1">${u.name} <span class="text-xs text-gray-500">(${u.behind} commit${u.behind > 1 ? 's' : ''} behind — ${u.local} → ${u.remote})</span></span>
+                    <button onclick="updatePlugin('${id}', this)" class="bg-accent/20 hover:bg-accent/30 text-accent-light px-3 py-1 rounded-lg text-xs transition">Update</button>`;
+                list.appendChild(row);
+            }
+        }
+    } catch (e) {
+        status.textContent = 'Failed to check for updates.';
+    }
+    btn.disabled = false;
+    btn.textContent = 'Check for Updates';
+}
+
+async function updatePlugin(pluginId, btn) {
+    btn.disabled = true;
+    btn.textContent = 'Updating...';
+    try {
+        const resp = await fetch(`/api/plugins/${pluginId}/update`, { method: 'POST' });
+        const data = await resp.json();
+        if (data.ok) {
+            btn.textContent = 'Updated — restart to apply';
+            btn.className = 'bg-green-900/30 text-green-400 px-3 py-1 rounded-lg text-xs';
+        } else {
+            btn.textContent = 'Failed';
+            btn.title = data.error || '';
+        }
+    } catch (e) {
+        btn.textContent = 'Error';
+    }
 }
 
 // ── Plugin functions loaded dynamically from plugin screen.js files ──────
@@ -594,6 +684,26 @@ function retuneSong(filename, title, tuning, target) {
 const audio = document.getElementById('audio');
 let isPlaying = false;
 let currentFilename = '';
+// Plugin context API — lightweight event bus for plugin integration
+window.slopsmith = Object.assign(new EventTarget(), {
+    currentSong: null,
+    isPlaying: false,
+    _navParams: {},
+    navigate(screenId, params) {
+        this._navParams = params || {};
+        showScreen(screenId);
+    },
+    getNavParams() {
+        const p = this._navParams;
+        this._navParams = {};
+        return p;
+    },
+    emit(event, detail) {
+        this.dispatchEvent(new CustomEvent(event, { detail }));
+    },
+    on(event, fn) { this.addEventListener(event, fn); },
+    off(event, fn) { this.removeEventListener(event, fn); }
+});
 
 // Debug audio issues
 audio.addEventListener('pause', () => { if (isPlaying) console.log('Audio paused unexpectedly at', audio.currentTime.toFixed(1)); });
@@ -604,7 +714,21 @@ audio.addEventListener('error', (e) => {
 });
 audio.addEventListener('stalled', () => console.log('Audio stalled at', audio.currentTime.toFixed(1)));
 audio.addEventListener('waiting', () => console.log('Audio waiting/buffering at', audio.currentTime.toFixed(1)));
-audio.addEventListener('ended', () => { console.log('Audio ended'); isPlaying = false; document.getElementById('btn-play').textContent = '▶ Play'; });
+audio.addEventListener('ended', () => {
+    console.log('Audio ended'); isPlaying = false;
+    document.getElementById('btn-play').textContent = '▶ Play';
+    window.slopsmith.isPlaying = false;
+    window.slopsmith.emit('song:ended', { time: audio.currentTime });
+});
+audio.addEventListener('play', () => {
+    window.slopsmith.isPlaying = true;
+    window.slopsmith.emit('song:play', { time: audio.currentTime });
+});
+audio.addEventListener('pause', () => {
+    if (!isPlaying) return;
+    window.slopsmith.isPlaying = false;
+    window.slopsmith.emit('song:pause', { time: audio.currentTime });
+});
 
 // Abort controller for cancelling pending requests when entering player
 let artAbortController = null;
@@ -670,6 +794,7 @@ function changeArrangement(index) {
         };
 
         highway.reconnect(currentFilename, index);
+        window.slopsmith.emit('arrangement:changed', { index, filename: currentFilename });
     }
 }
 
@@ -1074,6 +1199,17 @@ async function pollScanStatus() {
     try {
         const resp = await fetch('/api/scan-status');
         const data = await resp.json();
+        if (data.stage === 'error' && data.error) {
+            // Surface the error in the banner and stop polling.
+            showScanBanner();
+            const file = document.getElementById('scan-file');
+            const prog = document.getElementById('scan-progress');
+            if (file) { file.textContent = 'Scan failed: ' + data.error; file.classList.add('text-red-400'); }
+            if (prog) prog.textContent = 'Error';
+            clearInterval(_scanPollId);
+            _scanPollId = null;
+            return;
+        }
         if (data.running) {
             showScanBanner();
             const pct = data.total > 0 ? Math.round(data.done / data.total * 100) : 0;
@@ -1083,8 +1219,8 @@ async function pollScanStatus() {
             if (bar) bar.style.width = pct + '%';
             if (prog) prog.textContent = `${data.done} / ${data.total} (${pct}%)`;
             if (file) {
-                const name = data.current.replace(/_p\.psarc$/i, '').replace(/_/g, ' ');
-                file.textContent = name || 'Processing...';
+                const name = (data.current || '').replace(/_p\.psarc$/i, '').replace(/_/g, ' ');
+                file.textContent = name || (data.stage === 'listing' ? 'Listing DLC folder...' : 'Processing...');
             }
         } else {
             if (document.getElementById('scan-banner')) {

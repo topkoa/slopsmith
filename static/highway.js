@@ -6,6 +6,10 @@ function createHighway() {
     let canvas, ctx, ws;
     let currentTime = 0;
     let animFrame = null;
+    let _connectOpts = {};
+    let _resizeContainer = null;
+    let _resizeHandler = null;
+    let _onLyricsChange = null;
 
     // Song data (populated via WebSocket)
     let songInfo = {};
@@ -19,7 +23,7 @@ function createHighway() {
     let toneChanges = [];
     let toneBase = "";
     let ready = false;
-    let showLyrics = true;
+    let showLyrics = localStorage.getItem('showLyrics') !== 'false';
     let _drawHooks = [];  // plugin draw callbacks: fn(ctx, W, H)
     let _renderScale = parseFloat(localStorage.getItem('renderScale') || '1');  // 1 = full, 0.5 = half res
     let _inverted = localStorage.getItem('invertHighway') === 'true';
@@ -119,14 +123,12 @@ function createHighway() {
     }
 
     // ── Drawing ──────────────────────────────────────────────────────────
-    let _drawCount = 0;
     function draw() {
         animFrame = requestAnimationFrame(draw);
         if (!canvas || !ready) return;
         try {
         const W = canvas.width;
         const H = canvas.height;
-        if (_drawCount++ < 3) console.log(`draw: W=${W} H=${H} t=${currentTime.toFixed(2)} notes=${notes.length}`);
         ctx.fillStyle = BG;
         ctx.fillRect(0, 0, W, H);
 
@@ -725,67 +727,114 @@ function createHighway() {
         const fontSize = Math.max(18, H * 0.028) | 0;
         const lineY = H * 0.04;
 
-        // Find phrases: groups of words separated by gaps > 2s or "+" endings
-        // Pre-build phrases once (cache)
-        if (!lyrics._phrases) {
-            lyrics._phrases = [];
-            let phrase = [];
+        // Rocksmith vocal markers: a trailing "-" means the syllable joins the
+        // next one into a single word (no space); a trailing "+" marks the end
+        // of an authored line. Build a flat list of authored lines so we can
+        // cap rendering to a 2-line rolling window (current + upcoming).
+        if (!lyrics._lines) {
+            const lines = [];
+            let line = null, word = null;
+
+            const flushWord = () => {
+                if (word && word.length) line.words.push(word);
+                word = null;
+            };
+            const flushLine = () => {
+                flushWord();
+                if (line && line.words.length) lines.push(line);
+                line = null;
+            };
+
             for (let i = 0; i < lyrics.length; i++) {
                 const l = lyrics[i];
-                if (phrase.length > 0) {
-                    const prev = phrase[phrase.length - 1];
-                    const gap = l.t - (prev.t + prev.d);
-                    if (gap > 2.0) {
-                        lyrics._phrases.push(phrase);
-                        phrase = [];
-                    }
+                const raw = l.w || '';
+                const endsLine = raw.endsWith('+');
+                const continuesWord = raw.endsWith('-');
+
+                // Safety fallback: if a song has no "+" markers at all, force a
+                // line break on any gap > 4s so we never build a single giant line.
+                if (line && i > 0) {
+                    const prev = lyrics[i - 1];
+                    if (l.t - (prev.t + prev.d) > 4.0) flushLine();
                 }
-                phrase.push(l);
+
+                if (!line) line = { words: [], start: l.t, end: l.t + l.d };
+                if (!word) word = [];
+
+                word.push(l);
+                line.end = Math.max(line.end, l.t + l.d);
+
+                if (!continuesWord) flushWord();
+                if (endsLine) flushLine();
             }
-            if (phrase.length) lyrics._phrases.push(phrase);
+            flushLine();
+
+            lyrics._lines = lines;
         }
 
-        // Find the current phrase
-        let currentPhrase = null;
-        for (const p of lyrics._phrases) {
-            const start = p[0].t;
-            const end = p[p.length - 1].t + p[p.length - 1].d;
-            if (currentTime >= start - 0.5 && currentTime <= end + 1.0) {
-                currentPhrase = p;
-                break;
-            }
+        const allLines = lyrics._lines;
+        if (!allLines.length) return;
+
+        // Current line = most recently started line. Before the first line has
+        // started, preview the first line if it's within 2s of starting.
+        let currentIdx = -1;
+        for (let i = 0; i < allLines.length; i++) {
+            if (allLines[i].start <= currentTime) currentIdx = i;
+            else break;
+        }
+        if (currentIdx === -1) {
+            if (allLines[0].start - currentTime > 2.0) return;
+            currentIdx = 0;
         }
 
-        if (!currentPhrase) return;
+        const currentLine = allLines[currentIdx];
+        const nextLine = allLines[currentIdx + 1] || null;
+        const gapToNext = nextLine ? (nextLine.start - currentLine.end) : Infinity;
 
-        // Split phrase into rows that fit within maxWidth
-        const maxWidth = W * 0.8;
+        // Hide once the current line is clearly over and nothing relevant follows.
+        if (currentTime > currentLine.end + 0.5 && gapToNext > 3.0) return;
+
+        const linesToShow = [currentLine];
+        if (nextLine && gapToNext <= 3.0) linesToShow.push(nextLine);
+
+        const sylText = (s) => {
+            const t = s.w || '';
+            return (t.endsWith('+') || t.endsWith('-')) ? t.slice(0, -1) : t;
+        };
+
         ctx.font = `bold ${fontSize}px sans-serif`;
+        const spaceWidth = ctx.measureText(' ').width;
+        const maxWidth = W * 0.8;
 
+        // Respect authored line breaks; wrap only if a line overflows maxWidth.
         const rows = [];
-        let currentRow = [];
-        let currentRowWidth = 0;
-
-        for (let i = 0; i < currentPhrase.length; i++) {
-            const word = currentPhrase[i].w.replace(/\+$/, '') + ' ';
-            const wordWidth = ctx.measureText(word).width;
-
-            if (currentRow.length > 0 && currentRowWidth + wordWidth > maxWidth) {
-                rows.push(currentRow);
-                currentRow = [];
-                currentRowWidth = 0;
+        for (const authoredLine of linesToShow) {
+            let row = [], rowWidth = 0;
+            for (const wordSyls of authoredLine.words) {
+                const parts = [];
+                let wordWidth = 0;
+                for (const s of wordSyls) {
+                    const text = sylText(s);
+                    const w = ctx.measureText(text).width;
+                    parts.push({ syl: s, text, width: w });
+                    wordWidth += w;
+                }
+                const advance = wordWidth + spaceWidth;
+                if (row.length > 0 && rowWidth + advance > maxWidth) {
+                    rows.push(row);
+                    row = []; rowWidth = 0;
+                }
+                row.push({ parts, advance });
+                rowWidth += advance;
             }
-            currentRow.push({ lyric: currentPhrase[i], text: word, width: wordWidth });
-            currentRowWidth += wordWidth;
+            if (row.length) rows.push(row);
         }
-        if (currentRow.length) rows.push(currentRow);
 
-        // Draw background
         const rowHeight = fontSize + 6;
         const totalHeight = rows.length * rowHeight + 10;
         let bgWidth = 0;
         for (const row of rows) {
-            const rw = row.reduce((s, w) => s + w.width, 0);
+            const rw = row.reduce((s, w) => s + w.advance, 0) - spaceWidth;
             if (rw > bgWidth) bgWidth = rw;
         }
         bgWidth = Math.min(bgWidth + 30, W * 0.85);
@@ -794,34 +843,36 @@ function createHighway() {
         roundRect(ctx, W/2 - bgWidth/2, lineY - 4, bgWidth, totalHeight, 8);
         ctx.fill();
 
-        // Draw each row
         ctx.textAlign = 'left';
         ctx.textBaseline = 'top';
 
         for (let r = 0; r < rows.length; r++) {
             const row = rows[r];
-            const rowWidth = row.reduce((s, w) => s + w.width, 0);
+            const rowWidth = row.reduce((s, w) => s + w.advance, 0) - spaceWidth;
             let xPos = W/2 - rowWidth/2;
             const yPos = lineY + r * rowHeight + 2;
 
             for (const w of row) {
-                const l = w.lyric;
-                const isActive = currentTime >= l.t && currentTime < l.t + l.d;
-                const isPast = currentTime >= l.t + l.d;
+                for (const part of w.parts) {
+                    const l = part.syl;
+                    const isActive = currentTime >= l.t && currentTime < l.t + l.d;
+                    const isPast = currentTime >= l.t + l.d;
 
-                if (isActive) {
-                    ctx.fillStyle = '#4ae0ff';
-                    ctx.font = `bold ${fontSize}px sans-serif`;
-                } else if (isPast) {
-                    ctx.fillStyle = '#8899aa';
-                    ctx.font = `normal ${fontSize}px sans-serif`;
-                } else {
-                    ctx.fillStyle = '#556677';
-                    ctx.font = `normal ${fontSize}px sans-serif`;
+                    if (isActive) {
+                        ctx.fillStyle = '#4ae0ff';
+                        ctx.font = `bold ${fontSize}px sans-serif`;
+                    } else if (isPast) {
+                        ctx.fillStyle = '#8899aa';
+                        ctx.font = `normal ${fontSize}px sans-serif`;
+                    } else {
+                        ctx.fillStyle = '#556677';
+                        ctx.font = `normal ${fontSize}px sans-serif`;
+                    }
+
+                    ctx.fillText(part.text, xPos, yPos);
+                    xPos += part.width;
                 }
-
-                ctx.fillText(w.text, xPos, yPos);
-                xPos += w.width;
+                xPos += spaceWidth;
             }
         }
     }
@@ -860,22 +911,32 @@ function createHighway() {
     }
 
     // ── Public API ───────────────────────────────────────────────────────
-    return {
-        init(canvasEl) {
+    const api = {
+        init(canvasEl, container) {
             canvas = canvasEl;
+            _resizeContainer = container || null;
             ctx = canvas.getContext('2d');
             this.resize();
-            window.addEventListener('resize', () => this.resize());
+            if (_resizeHandler) window.removeEventListener('resize', _resizeHandler);
+            _resizeHandler = () => this.resize();
+            window.addEventListener('resize', _resizeHandler);
             ready = false;
             notes = []; chords = []; beats = []; sections = []; anchors = []; lyrics = []; toneChanges = []; toneBase = "";
         },
 
         resize() {
             if (!canvas) return;
-            const controls = document.getElementById('player-controls');
-            const controlsH = controls ? controls.offsetHeight : 50;
-            const w = document.documentElement.clientWidth;
-            const h = document.documentElement.clientHeight - controlsH;
+            let w, h;
+            if (_resizeContainer) {
+                const rect = _resizeContainer.getBoundingClientRect();
+                w = rect.width;
+                h = rect.height;
+            } else {
+                const controls = document.getElementById('player-controls');
+                const controlsH = controls ? controls.offsetHeight : 50;
+                w = document.documentElement.clientWidth;
+                h = document.documentElement.clientHeight - controlsH;
+            }
             canvas.style.width = w + 'px';
             canvas.style.height = h + 'px';
             canvas.width = Math.round(w * _renderScale);
@@ -899,7 +960,8 @@ function createHighway() {
 
         getLefty() { return _lefty; },
 
-        connect(wsUrl) {
+        connect(wsUrl, opts = {}) {
+            _connectOpts = opts;
             ws = new WebSocket(wsUrl);
             ws.onclose = () => { console.log('WS closed'); };
             ws.onerror = (e) => { console.error('WS error', e); };
@@ -907,7 +969,8 @@ function createHighway() {
                 const msg = JSON.parse(ev.data);
                 if (msg.error) {
                     console.error('Server error:', msg.error);
-                    alert('Error: ' + msg.error);
+                    if (opts.onError) opts.onError(msg.error);
+                    else alert('Error: ' + msg.error);
                     return;
                 }
                 switch (msg.type) {
@@ -916,68 +979,90 @@ function createHighway() {
                         break;
                     case 'song_info':
                         songInfo = msg;
-                        document.getElementById('hud-artist').textContent = msg.artist;
-                        document.getElementById('hud-title').textContent = msg.title;
-                        document.getElementById('hud-arrangement').textContent = msg.arrangement;
-                        if (msg.audio_url) {
-                            const audio = document.getElementById('audio');
-                            if (!audio.src || !audio.src.includes(msg.audio_url.split('/').pop())) {
-                                audio.src = msg.audio_url;
-                                audio.load();
+                        if (opts.onSongInfo) {
+                            opts.onSongInfo(msg);
+                        } else {
+                            document.getElementById('hud-artist').textContent = msg.artist;
+                            document.getElementById('hud-title').textContent = msg.title;
+                            document.getElementById('hud-arrangement').textContent = msg.arrangement;
+                            if (msg.audio_url) {
+                                const audio = document.getElementById('audio');
+                                if (!audio.src || !audio.src.includes(msg.audio_url.split('/').pop())) {
+                                    audio.src = msg.audio_url;
+                                    audio.load();
 
-                                // Show buffering overlay
-                                let overlay = document.getElementById('audio-buffer-overlay');
-                                if (!overlay) {
-                                    overlay = document.createElement('div');
-                                    overlay.id = 'audio-buffer-overlay';
-                                    overlay.className = 'fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm';
-                                    overlay.innerHTML = `
-                                        <div class="bg-dark-700 border border-gray-700 rounded-2xl p-6 w-72 text-center shadow-2xl">
-                                            <div class="text-sm text-gray-300 mb-3">Loading audio...</div>
-                                            <div style="height:6px;background:#1a1a2e;border-radius:999px;overflow:hidden">
-                                                <div id="audio-buffer-bar" style="height:100%;background:linear-gradient(90deg,#4080e0,#60a0ff);border-radius:999px;width:0%;transition:width 0.3s"></div>
-                                            </div>
-                                            <div class="text-xs text-gray-500 mt-2" id="audio-buffer-pct">0%</div>
-                                        </div>`;
-                                    document.body.appendChild(overlay);
-                                }
+                                    // Show buffering overlay
+                                    let overlay = document.getElementById('audio-buffer-overlay');
+                                    if (!overlay) {
+                                        overlay = document.createElement('div');
+                                        overlay.id = 'audio-buffer-overlay';
+                                        overlay.className = 'fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm';
+                                        overlay.innerHTML = `
+                                            <div class="bg-dark-700 border border-gray-700 rounded-2xl p-6 w-72 text-center shadow-2xl">
+                                                <div class="text-sm text-gray-300 mb-3">Loading audio...</div>
+                                                <div style="height:6px;background:#1a1a2e;border-radius:999px;overflow:hidden">
+                                                    <div id="audio-buffer-bar" style="height:100%;background:linear-gradient(90deg,#4080e0,#60a0ff);border-radius:999px;width:0%;transition:width 0.3s"></div>
+                                                </div>
+                                                <div class="text-xs text-gray-500 mt-2" id="audio-buffer-pct">0%</div>
+                                            </div>`;
+                                        document.body.appendChild(overlay);
+                                    }
 
-                                const bar = document.getElementById('audio-buffer-bar');
-                                const pct = document.getElementById('audio-buffer-pct');
+                                    const bar = document.getElementById('audio-buffer-bar');
+                                    const pct = document.getElementById('audio-buffer-pct');
 
-                                const MIN_BUFFER_SECS = 30;
+                                    const MIN_BUFFER_SECS = 30;
 
-                                function onProgress() {
-                                    if (audio.buffered.length > 0 && audio.duration > 0) {
-                                        const loaded = audio.buffered.end(audio.buffered.length - 1);
-                                        const p = Math.round((loaded / audio.duration) * 100);
-                                        if (bar) bar.style.width = p + '%';
-                                        if (pct) pct.textContent = p + '%';
-                                        // Dismiss when enough is buffered
-                                        if (loaded >= MIN_BUFFER_SECS || loaded >= audio.duration) {
-                                            cleanup();
+                                    function onProgress() {
+                                        if (audio.buffered.length > 0 && audio.duration > 0) {
+                                            const loaded = audio.buffered.end(audio.buffered.length - 1);
+                                            const p = Math.round((loaded / audio.duration) * 100);
+                                            if (bar) bar.style.width = p + '%';
+                                            if (pct) pct.textContent = p + '%';
+                                            // Dismiss when enough is buffered
+                                            if (loaded >= MIN_BUFFER_SECS || loaded >= audio.duration) {
+                                                cleanup();
+                                            }
                                         }
                                     }
-                                }
 
-                                function cleanup() {
-                                    audio.removeEventListener('progress', onProgress);
-                                    audio.removeEventListener('canplaythrough', cleanup);
-                                    const ol = document.getElementById('audio-buffer-overlay');
-                                    if (ol) ol.remove();
-                                }
+                                    function cleanup() {
+                                        audio.removeEventListener('progress', onProgress);
+                                        audio.removeEventListener('canplaythrough', cleanup);
+                                        const ol = document.getElementById('audio-buffer-overlay');
+                                        if (ol) ol.remove();
+                                    }
 
-                                audio.addEventListener('progress', onProgress);
-                                // Fallback: also dismiss on canplaythrough
-                                audio.addEventListener('canplaythrough', cleanup, { once: true });
+                                    audio.addEventListener('progress', onProgress);
+                                    // Fallback: also dismiss on canplaythrough
+                                    audio.addEventListener('canplaythrough', cleanup, { once: true });
+                                }
+                            }
+                            // Populate arrangement dropdown
+                            if (msg.arrangements) {
+                                const sel = document.getElementById('arr-select');
+                                sel.innerHTML = msg.arrangements.map(a =>
+                                    `<option value="${a.index}" ${a.index === msg.arrangement_index ? 'selected' : ''}>${a.name} (${a.notes})</option>`
+                                ).join('');
                             }
                         }
-                        // Populate arrangement dropdown
-                        if (msg.arrangements) {
-                            const sel = document.getElementById('arr-select');
-                            sel.innerHTML = msg.arrangements.map(a =>
-                                `<option value="${a.index}" ${a.index === msg.arrangement_index ? 'selected' : ''}>${a.name} (${a.notes})</option>`
-                            ).join('');
+                        // Plugin context API — broadcast current song state
+                        if (window.slopsmith) {
+                            const wsPath = ws.url.split('/ws/highway/')[1] || '';
+                            const filename = decodeURIComponent(wsPath.split('?')[0]);
+                            window.slopsmith.currentSong = {
+                                filename,
+                                title: msg.title,
+                                artist: msg.artist,
+                                duration: msg.duration,
+                                arrangement: msg.arrangement,
+                                arrangementIndex: msg.arrangement_index,
+                                arrangements: msg.arrangements || [],
+                                tuning: msg.tuning,
+                                capo: msg.capo,
+                                format: msg.format,
+                            };
+                            window.slopsmith.emit('song:loaded', window.slopsmith.currentSong);
                         }
                         break;
                     case 'beats': beats = msg.data; break;
@@ -997,7 +1082,7 @@ function createHighway() {
                         ready = true;
                         console.log(`Highway ready: ${notes.length} notes, ${chords.length} chords`);
                         if (!animFrame) draw();
-                        if (highway._onReady) highway._onReady();
+                        if (api._onReady) api._onReady();
                         break;
                 }
             };
@@ -1032,6 +1117,7 @@ function createHighway() {
         getSections() { return sections; },
         getSongInfo() { return songInfo; },
         addDrawHook(fn) { _drawHooks.push(fn); },
+        removeDrawHook(fn) { _drawHooks = _drawHooks.filter(h => h !== fn); },
         project(tOffset) { return project(tOffset); },
         fretX(fret, scale, w) { return fretX(fret, scale, w); },
 
@@ -1040,17 +1126,16 @@ function createHighway() {
 
         toggleLyrics() {
             showLyrics = !showLyrics;
-            const btn = document.getElementById('btn-lyrics');
-            if (btn) {
-                btn.textContent = showLyrics ? 'Lyrics ✓' : 'Lyrics ✗';
-                btn.className = showLyrics
-                    ? 'px-3 py-1.5 bg-purple-900/40 hover:bg-purple-900/60 rounded-lg text-xs text-purple-300 transition'
-                    : 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
-            }
+            localStorage.setItem('showLyrics', String(showLyrics));
+            if (_onLyricsChange) _onLyricsChange(showLyrics);
         },
 
         getLyricsVisible() { return showLyrics; },
-        setLyricsVisible(v) { showLyrics = !!v; },
+        setLyricsVisible(v) {
+            showLyrics = !!v;
+            if (_onLyricsChange) _onLyricsChange(showLyrics);
+        },
+        setOnLyricsChange(fn) { _onLyricsChange = fn; },
 
         reconnect(filename, arrangement) {
             // Close old WS but keep audio + animation running
@@ -1062,20 +1147,29 @@ function createHighway() {
             const decoded = decodeURIComponent(filename);
             const wsUrl = `${location.protocol === 'https:' ? 'wss:' : 'ws:'}//${location.host}/ws/highway/${decoded}${arrParam}`;
             console.log('reconnect:', wsUrl);
-            this.connect(wsUrl);
+            this.connect(wsUrl, _connectOpts);
         },
 
         stop() {
             if (animFrame) { cancelAnimationFrame(animFrame); animFrame = null; }
             if (ws) { ws.close(); ws = null; }
+            if (_resizeHandler) {
+                window.removeEventListener('resize', _resizeHandler);
+                _resizeHandler = null;
+            }
             ready = false;
-            const audio = document.getElementById('audio');
-            audio.pause();
-            audio.src = '';
-            isPlaying = false;
-            document.getElementById('btn-play').textContent = '▶ Play';
         },
     };
+    return api;
 }
 const highway = createHighway();
 window.highway = highway; // expose for plugins
+highway.setOnLyricsChange(function(visible) {
+    const btn = document.getElementById('btn-lyrics');
+    if (btn) {
+        btn.textContent = visible ? 'Lyrics \u2713' : 'Lyrics \u2717';
+        btn.className = visible
+            ? 'px-3 py-1.5 bg-purple-900/40 hover:bg-purple-900/60 rounded-lg text-xs text-purple-300 transition'
+            : 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition';
+    }
+});
