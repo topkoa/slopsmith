@@ -10,10 +10,10 @@ static/
   app.js               Main frontend — screens, library views, player, plugin loader
   highway.js           Canvas note highway renderer (createHighway factory)
   index.html           Single-page app shell
-  style.css            Tailwind dark theme
+  style.css            Custom CSS loaded alongside Tailwind
 lib/
   song.py              Core data models (Note, Chord, Arrangement, Song)
-  psarc.py             PSARC archive reading (in-memory, no temp files)
+  psarc.py             PSARC archive reading and extraction
   sloppak.py           Sloppak format support
   audio.py             WEM/OGG/MP3 audio handling
   retune.py            Pitch-shifting logic
@@ -56,7 +56,7 @@ All fields except `id` and `name` are optional. Plugins can have any combination
 
 **Frontend scripts** — `screen.js` runs in the global scope via a `<script>` tag. It can access `window.playSong`, `window.showScreen`, `window.createHighway`, the `<audio>` element, and the `window.slopsmith` event emitter.
 
-**The playSong wrapper chain** — Plugins commonly wrap `window.playSong` to hook into song playback. Plugins load alphabetically, so the wrapper chain executes innermost-first (alphabetically first plugin runs closest to the original). Be aware that `await` calls in inner wrappers yield to the event loop — WebSocket messages can arrive before outer wrappers finish setup.
+**The playSong wrapper chain** — Plugins commonly wrap `window.playSong` to hook into song playback. Plugins load alphabetically, so the last-loaded (alphabetically later) wrapper runs first, while the alphabetically first plugin runs closest to the original. Be aware that `await` calls in inner wrappers yield to the event loop — WebSocket messages can arrive before outer wrappers finish setup.
 
 ## Plugin Best Practices
 
@@ -114,11 +114,11 @@ An open, hand-editable song package designed for Slopsmith. Exists in two interc
 
 **Contents:**
 ```
-manifest.yaml          Song metadata (title, artist, album, duration, tuning, arrangements list)
+manifest.yaml          Song metadata (title, artist, album, duration, tuning, arrangement IDs, ...)
 arrangements/
-  Lead.json            Note/chord/anchor data in wire format (see song.py)
-  Rhythm.json
-  Bass.json
+  lead.json            Note/chord/anchor data in wire format (see song.py)
+  rhythm.json          Files here are driven by manifest.yaml arrangement entries
+  ...                  (e.g. arrangements/<arrangement-id>.json)
 stems/
   full.ogg             Mixed audio (always present)
   guitar.ogg           Individual stems (optional, from Demucs split)
@@ -143,7 +143,7 @@ Sloppak is the preferred format for new features. The [Sloppak Converter plugin]
 - **No frameworks** — vanilla JS, fetch API, DOM manipulation
 - **Globals** — `highway`, `audio`, `playSong()`, `showScreen()`, `createHighway()`, `window.slopsmith`
 - **Storage** — `localStorage` for all user preferences
-- **Styling** — Tailwind CSS utility classes, dark theme (`bg-dark-600`, `text-gray-300`, accent `#ffd700`)
+- **Styling** — Tailwind CSS utility classes, dark theme (`bg-dark-600`, `text-gray-300`, accent `#4080e0`, gold `#e8c040`)
 - **Naming** — camelCase for JS functions, kebab-case for CSS classes, snake_case for plugin IDs
 - **Player layout** — `#player` is `display:flex; flex-direction:column; position:fixed; inset:0`. `#highway` is `flex:1`. `#player-controls` sits at the bottom. Hiding the highway collapses the layout — use `margin-top: auto` on controls if you need to hide it.
 
@@ -173,7 +173,7 @@ pytest -k "round_trip" -v      # Pattern match
 ## Git Workflow
 
 - **Never push directly to main** — always create a feature branch and open a PR
-- **Upstream remote** — `upstream` points to `byrongamatos/slopsmith` (the original repo); `origin` is the fork
+- **Upstream remote** — set `upstream` to the canonical Slopsmith repository; `origin` is your fork
 - **Plugins are gitlinks** — each plugin in `plugins/` is typically its own git repo (submodule or clone). Branch switches on the main repo can clobber plugin directories. Use `git update-index --assume-unchanged` for plugin dirs if needed.
 - **Commit style** — short imperative subject line, blank line, then body explaining *why*
 
@@ -183,22 +183,23 @@ The highway WebSocket at `/ws/highway/{filename}?arrangement={index}` streams th
 
 | Message | Shape | Description |
 |---------|-------|-------------|
+| `loading` | `{ type: 'loading', stage }` | Status/progress message during extraction or conversion |
 | `song_info` | `{ type, title, artist, arrangement, duration, tuning, capo }` | Song metadata. `tuning` is an array (6 for guitar, 4 for bass). |
-| `sections` | `{ type, data: [{ time, name }] }` | Named sections (Intro, Verse, Chorus, etc.) |
 | `beats` | `{ type, data: [{ time, measure }] }` | Beat timestamps with measure numbers |
+| `sections` | `{ type, data: [{ time, name }] }` | Named sections (Intro, Verse, Chorus, etc.) |
 | `anchors` | `{ type, data: [{ time, fret, width }] }` | Fret zoom anchors |
 | `chord_templates` | `{ type, data: [{ name, frets: [6] }] }` | Named chord shapes |
-| `tones` | `{ type, data: [{ time, name }] }` | Tone change events (if present) |
+| `tone_changes` | `{ type: 'tone_changes', base, data: [{ time, name }] }` | Tone change events relative to the arrangement base tone (if present) |
+| `lyrics` | `{ type, data: [{ w, t, d }] }` | Syllables: `w`=word, `t`=time, `d`=duration. `-` joins to previous, `+` = line break |
 | `notes` | `{ type, data: [{ t, s, f, sus, ho, po, sl, bn, ... }] }` | Single notes |
 | `chords` | `{ type, data: [{ t, notes: [{ s, f, sus, ... }] }] }` | Chord events |
-| `lyrics` | `{ type, data: [{ w, t, d }] }` | Syllables: `w`=word, `t`=time, `d`=duration. `-` joins to previous, `+` = line break |
 | `ready` | `{ type: 'ready' }` | All data sent — safe to finalize and start rendering |
 
-Do not start rendering until you receive `ready`.
+Message delivery is incremental. You may receive `loading` updates and `lyrics` before note/chord payloads; do not finalize rendering until you receive `ready`.
 
 ## Common Pitfalls
 
-1. **playSong wrapper race condition** — The wrapper chain runs innermost-first. If an inner plugin (e.g. `3dhighway`) does `await import(CDN)`, it yields to the event loop. WebSocket messages (`song_info`, `ready`) can arrive before outer plugins set their callbacks. Use `getSongInfo()` as a fallback rather than relying solely on `_onReady`.
+1. **playSong wrapper race condition** — The wrapper chain runs outermost-first (last-loaded wrapper runs first). If an inner plugin (e.g. `3dhighway`) does `await import(CDN)`, it yields to the event loop. WebSocket messages (`song_info`, `ready`) can arrive before outer plugins set their callbacks. Use `getSongInfo()` as a fallback rather than relying solely on `_onReady`.
 
 2. **Plugin gitlinks** — Plugins are separate git repos cloned into `plugins/`. Switching branches on the main repo can delete or clobber these directories. Be careful with `git checkout` and `git clean`.
 
