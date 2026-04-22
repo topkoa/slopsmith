@@ -598,7 +598,12 @@ def _periodic_rescan():
 @app.get("/api/version")
 def get_version():
     version_file = Path(__file__).parent / "VERSION"
-    version = version_file.read_text().strip() if version_file.exists() else "unknown"
+    version = "unknown"
+    if version_file.exists():
+        try:
+            version = version_file.read_text().strip()
+        except (OSError, UnicodeDecodeError):
+            pass
     return {"version": version}
 
 
