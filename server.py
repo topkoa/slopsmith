@@ -597,6 +597,9 @@ def _periodic_rescan():
 
 @app.get("/api/version")
 def get_version():
+    env_version = os.environ.get("APP_VERSION", "").strip()
+    if env_version:
+        return {"version": env_version}
     version_file = Path(__file__).parent / "VERSION"
     version = "unknown"
     if version_file.exists():
