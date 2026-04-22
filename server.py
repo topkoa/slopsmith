@@ -595,6 +595,13 @@ def _periodic_rescan():
         time.sleep(300)
 
 
+@app.get("/api/version")
+def get_version():
+    version_file = Path(__file__).parent / "VERSION"
+    version = version_file.read_text().strip() if version_file.exists() else "unknown"
+    return {"version": version}
+
+
 @app.get("/api/scan-status")
 def scan_status():
     return _scan_status

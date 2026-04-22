@@ -1368,4 +1368,11 @@ async function loadPlugins() {
 loadPlugins().then(() => {
     setLibView('grid');
     checkScanAndLoad();
+    fetch('/api/version')
+        .then(r => r.json())
+        .then(d => {
+            const el = document.getElementById('app-version');
+            if (el && d.version) el.textContent = 'v' + d.version;
+        })
+        .catch(() => {});
 });
