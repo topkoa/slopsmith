@@ -105,7 +105,7 @@ Reference implementations:
 Slopsmith supports two song formats:
 
 ### PSARC (Rocksmith native)
-The original Rocksmith 2014 archive format. Contains encrypted SNG note data, WEM audio, album art, and tone presets. Read-only — Slopsmith extracts metadata in-memory via `lib/psarc.py` without unpacking to disk. Audio is decoded via `vgmstream-cli` + `ffmpeg`.
+The original Rocksmith 2014 archive format. Contains encrypted SNG note data, WEM audio, album art, and tone presets. Read-only — Slopsmith does fast metadata scanning in-memory via `lib/psarc.py` (`read_psarc_entries`) without fully unpacking the archive, but playback and conversion paths extract the PSARC to a temporary directory via `unpack_psarc()` before loading note/audio assets. Audio is decoded via `vgmstream-cli` + `ffmpeg`.
 
 ### Sloppak (open format)
 An open, hand-editable song package designed for Slopsmith. Exists in two interchangeable forms:
@@ -189,13 +189,13 @@ The highway WebSocket at `/ws/highway/{filename}?arrangement={index}` streams th
 | `sections` | `{ type, data: [{ time, name }] }` | Named sections (Intro, Verse, Chorus, etc.) |
 | `anchors` | `{ type, data: [{ time, fret, width }] }` | Fret zoom anchors |
 | `chord_templates` | `{ type, data: [{ name, frets: [6] }] }` | Named chord shapes |
-| `tone_changes` | `{ type: 'tone_changes', base, data: [{ time, name }] }` | Tone change events relative to the arrangement base tone (if present) |
 | `lyrics` | `{ type, data: [{ w, t, d }] }` | Syllables: `w`=word, `t`=time, `d`=duration. `-` joins to previous, `+` = line break |
+| `tone_changes` | `{ type: 'tone_changes', base, data: [{ time, name }] }` | Optional — tone change events relative to the arrangement base tone; only sent if tones were found |
 | `notes` | `{ type, data: [{ t, s, f, sus, ho, po, sl, bn, ... }] }` | Single notes |
 | `chords` | `{ type, data: [{ t, notes: [{ s, f, sus, ... }] }] }` | Chord events |
 | `ready` | `{ type: 'ready' }` | All data sent — safe to finalize and start rendering |
 
-Message delivery is incremental. You may receive `loading` updates and `lyrics` before note/chord payloads; do not finalize rendering until you receive `ready`.
+Message delivery is incremental. You may receive `loading` updates and `lyrics` before note/chord payloads; `tone_changes` comes after `lyrics` when present and may be omitted entirely. Do not finalize rendering until you receive `ready`.
 
 ## Common Pitfalls
 
